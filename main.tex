@@ -23,6 +23,8 @@ The NATO reports of the late 1960s named a ``Software Crisis'' of over-budget an
 
 The core problem persists: we are building systems we cannot test. While Software 1.0 lacked type discipline for mutable state, Software 2.0 lacks type discipline for \emph{context}. The context window is a global mutable bag of tokens that shapes all downstream probabilities; small changes have non-local effects. When temperature exceeds zero or the model checkpoint silently changes \cite{openai2023}, unit tests become flaky or meaningless. Teams resort to manual sampling or offline human evaluations, which are costly and brittle. The result is accidental complexity at scale.
 
+This paper extends the original argument with three observations. First, stochasticity has moved the bottleneck from construction to validation. Second, the ``language'' we program in (natural language prompts) is untyped and mutable, reintroducing the evils of shared state through context ordering. Third, the tooling culture celebrates artisanal prompt crafting rather than disciplined system design. We treat these as symptoms of the Token Pit.
+
 \section{Complexity: Essential vs Accidental}
 Moseley and Marks separated essential complexity (the inherent difficulty of the problem) from accidental complexity (introduced by the solution method). That framing remains sound for LLM applications.
 
@@ -38,15 +40,21 @@ Moseley and Marks separated essential complexity (the inherent difficulty of the
 
 The lesson from 2006 still applies: accidental complexity dominates, and most bugs are self-inflicted by our chosen abstractions. We therefore confirm the original thesis that complexity---not performance---is the critical engineering bottleneck.
 
+We also extend the framing to cost. Every manual prompt tweak typically requires: (1) re-running sample transcripts, (2) recalibrating retrieval heuristics, (3) rewriting brittle regex-based parsers, and (4) subjectively judging outputs. This is engineering effort spent on accidental, not essential, work. A disciplined interface for intents would make most of this tunable or automated.
+
 \section{The Villain: From Mutable State to Probabilistic Context}
 In the Tar Pit, mutable state caused action-at-a-distance, making reasoning hard. In the Token Pit, \emph{unstructured context} plays the same role. The LLM's effective program is the concatenation of instructions in the prompt; reordering two sentences can change the probability distribution of a token generated thousands of words later. This is the worst kind of coupling.
 
 Moreover, non-determinism introduces flaky execution. For temperature greater than zero, repeated calls yield different outputs; even at zero, model version shifts or floating-point nondeterminism can alter results. Traditional unit tests assume repeatability; here, the underlying ``runtime'' is stochastic. We therefore reject the idea that prompt-level heuristics can be unit-tested like pure functions; instead, we must design for statistical evaluation and bounded nondeterminism \cite{langosco2021goal}.
 
+Probabilistic context also undermines modularity. A retrieval module can leak irrelevant tokens that bias a downstream planner; a logging string can perturb the distribution. This mirrors the original ``action at a distance'' critique of mutable state, now amplified by a continuous probability simplex. Without an interface boundary that constrains inputs and outputs, compositionality collapses.
+
 \section{The Tar Pit Revisited: Evaluation as the New Integration}
 The Tar Pit metaphor originally captured the cost of integrating mutable, stateful components. In Software 2.0, integration is cheap (REST calls to APIs), but evaluation dominates. Each prompt modification demands a battery of A/B tests, synthetic benchmarks, and human review \cite{liang2023holistic}. Feedback loops are slow and expensive; regression surface is vast. Without typed contracts, changes in system prompts ripple through entire chains of tools (e.g., function calling, retrieval, planning) \cite{yao2023react}. The absence of compositional guarantees means that improvements in one capability often degrade others.
 
 This suggests a need to treat prompts as \emph{programs} with explicit interfaces, rather than as opaque strings. Just as FRP encapsulated state, we must encapsulate context and constrain outputs.
+
+Evaluation itself must be rethought. Statistical confidence intervals, stratified benchmarks, and property-based testing against invariants (e.g., schema validity, citation presence) should replace anecdotal spot checks. Offline corpora provide stable distributions; online canaries catch drift. The goal is not determinism, but bounded stochastic behavior with measurable guarantees.
 
 \section{Deterministic Intent Programming (DIP)}
 We propose Deterministic Intent Programming, a modern analogue to FRP. DIP isolates developer intent from surface wording, compiles intents into structured calls, and enforces typed outputs. Three rules follow.
@@ -59,6 +67,22 @@ Logic is essential: retrieve, resolve ambiguity, and produce a summary. Wording 
 
 \subsection{Enforce Structured Outputs}
 LLMs should emit structured objects except when free-form text is the goal. Constrained decoding, JSON mode, or linearized schema formats reduce entropy and simplify downstream validation \cite{andreas2022language}. This mirrors the FRP restriction that every effect passes through explicit channels. When the model functions as a reasoning engine, its outputs should resemble database rows, not conversation transcripts.
+
+A companion rule is to surface failures as first-class. If decoding fails schema validation, the system should emit an error type, not silently coerce. This preserves referential transparency at the interface: the same inputs lead either to a valid object or a typed failure, never to ambiguous partial strings.
+
+Finally, DIP demands that evaluation be attached to signatures. Each intent should carry tests: invariants (always return JSON), metamorphic properties (adding irrelevant facts should not change answers), and task metrics (accuracy/F1/ROUGE where applicable). This closes the loop between interface and verification.
+
+\section{Engineering for DIP: Testing and Operations}
+DIP is an architectural stance; it also needs operational practice. We outline a minimal stack:
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Typed interfaces}: Every LLM call expressed as a signature with input/output schemas and enumerated modes.
+  \item \textbf{Prompt compiler}: An automatic synthesizer/optimizer (e.g., DSPy) that searches wording/ordering given frozen evaluation sets.
+  \item \textbf{Constrained decoding}: JSON mode or grammar-based decoding to enforce structure at generation time, not post-hoc.
+  \item \textbf{Evaluation harness}: Stratified test sets (happy-path, adversarial, long-context) with statistical thresholds; property-based fuzzing for invariants.
+  \item \textbf{Versioned contexts}: Hashes of prompts, retrieval policies, and model checkpoints recorded per release to enable rollback and diffing.
+  \item \textbf{Canaries and shadowing}: Low-risk traffic mirrors to detect drift before full rollout.
+\end{itemize}
+These practices mirror the configuration discipline advocated for FRP: explicit dependencies, limited effects, and reproducibility.
 
 \section{Accidental Complexity in Retrieval-Augmented Generation}
 Retrieval-Augmented Generation (RAG) introduces another axis of accidental complexity. Selecting, chunking, and ordering context documents is non-trivial; missteps yield hallucinations or ``lost in the middle'' failures \cite{lewis2020rag,liu2023lost}. DIP mitigates this by:
@@ -97,6 +121,19 @@ def translate_with_clarification(text, lang, tone="plain"):
 
 This mirrors FRP's discipline: logic is explicit, stateful wording is hidden behind deterministic interfaces.
 
+One could extend this with evaluation hooks:
+\begin{verbatim}
+from dspy.testing import assert_schema, assert_invariants
+
+@program
+def translate_with_guards(text, lang, tone="plain"):
+    draft = translate_with_clarification(text, lang, tone)
+    assert_schema(draft)
+    assert_invariants(draft, [no_pii, includes_required_terms])
+    return draft
+\end{verbatim}
+Here the tests are attached to the intent, not bolted on via ad hoc scripts. Failures are explicit and typed, avoiding silent regressions.
+
 \section{Relation to the Original Claims}
 \paragraph{Confirmed.} Complexity is the primary obstacle; unstructured state/context causes non-local coupling; systems must minimize implicit effects. Functional decomposition and explicit interfaces remain effective.
 
@@ -104,19 +141,22 @@ This mirrors FRP's discipline: logic is explicit, stateful wording is hidden beh
 
 \paragraph{Rejected or insufficient.} Hand-written prompts and ad hoc testing cannot deliver reliability. Treating LLMs as chatbots underestimates the need for compilation, constraint, and evaluation pipelines.
 
+\section{Limitations and Open Problems}
+Two caveats temper the DIP proposal. First, compilation targets (LLM checkpoints) evolve; even with typed interfaces, behavior can drift, necessitating continual evaluation and possibly ensemble techniques. Second, many tasks require free-form generation (poetry, creative ideation) where strict schemas may suppress value. For these, DIP can still bound behavior through content filters and lightweight contracts, but guarantees are weaker. Finally, large-scale evaluation remains expensive; automated optimizers risk overfitting to narrow benchmarks. We expect hybrid human-in-the-loop evaluation to remain necessary.
+
 \section{Conclusion}
 We are still in an assembly era, manually moving tokens and writing prompts in natural-language hex. To climb out of the Token Pit, we must stop acting as prompt whisperers and start acting as AI systems engineers. Deterministic Intent Programming---typed interfaces, compiled wording, constrained decoding, and automated evaluation---encapsulates stochasticity and separates essential reasoning from accidental syntax. The Tar Pit lesson endures: escape requires discipline, not incantation.
 
 \begin{thebibliography}{99}
 
 \bibitem{nato1968}
-NATO Science Committee. Software Engineering: Report on a Conference Sponsored by the NATO Science Committee, Garmisch, Germany, 1968.
+NATO Science Committee. Software Engineering: Report on a Conference Sponsored by the NATO Science Committee, Garmisch, Germany, 1968. Available at \url{http://homepages.cs.ncl.ac.uk/brian.randell/NATO/nato1968.pdf} (accessed December 2025).
 
 \bibitem{brooks1987}
 F. P. Brooks. No Silver Bullet: Essence and Accidents of Software Engineering. IEEE Computer 20(4), 1987. DOI: 10.1109/MC.1987.1663532.
 
 \bibitem{moseley2006}
-B. Moseley and P. Marks. Out of the Tar Pit. Software Architecture References, 2006.
+B. Moseley and P. Marks. Out of the Tar Pit. Software Architecture References, 2006. Available at \url{https://curtclifton.net/papers/MoseleyMarks06a.pdf} (accessed December 2025).
 
 \bibitem{openai2023}
 OpenAI. GPT-4 Technical Report. arXiv:2303.08774, 2023. DOI: 10.48550/arXiv:2303.08774.
@@ -143,7 +183,7 @@ J. Etemadi, A. Bshara. Instructor: Structured Output for Large Language Models w
 J. Andreas. Language Models as Hypothesis Engines. arXiv:2212.14052, 2022. DOI: 10.48550/arXiv:2212.14052.
 
 \bibitem{sutton2019bitter}
-R. Sutton. The Bitter Lesson. Incomplete Ideas Blog, 2019.
+R. Sutton. The Bitter Lesson. Incomplete Ideas Blog, 2019. Available at \url{http://www.incompleteideas.net/IncIdeas/BitterLesson.html} (accessed December 2025).
 
 \bibitem{lewis2020rag}
 P. Lewis, E. Perez, A. Piktus, et al. Retrieval-Augmented Generation for Knowledge-Intensive NLP. arXiv:2005.11401, 2020. DOI: 10.48550/arXiv:2005.11401.
